@@ -94,9 +94,9 @@ class SIDDataset(Dataset):
         return s
 
 
-def class_balanced_sampler(ds):
+def class_balanced_sampler(ds, generator=None):
     """Draws about the same number of samples from each class in every batch."""
     labels = ds.sample_labels()
     counts = Counter(labels)
     weights = [1.0 / counts[y] for y in labels]
-    return WeightedRandomSampler(weights, num_samples=len(labels), replacement=True)
+    return WeightedRandomSampler(weights, num_samples=len(labels), replacement=True, generator=generator)

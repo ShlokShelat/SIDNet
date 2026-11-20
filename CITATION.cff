@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this code or the SID datasets, please cite the paper."
+title: "SIDNet: The Sandpile Identification Problem"
+license: MIT
+repository-code: "https://github.com/ShlokShelat/SIDNet"
+authors:
+  - family-names: Salvi
+    given-names: Shrey
+    affiliation: Ahmedabad University
+    orcid: "https://orcid.org/0009-0009-6329-6666"
+  - family-names: Shelat
+    given-names: Shlok
+    affiliation: Ahmedabad University
+    orcid: "https://orcid.org/0009-0001-2326-3490"
+  - family-names: Roy
+    given-names: Souvik
+    affiliation: Ahmedabad University
+    orcid: "https://orcid.org/0000-0002-2052-1837"
+preferred-citation:
+  type: article
+  title: "The Sandpile Identification Problem: Recovering Directional Noise from Space-time Dynamics"
+  authors:
+    - family-names: Salvi
+      given-names: Shrey
+    - family-names: Shelat
+      given-names: Shlok
+    - family-names: Roy
+      given-names: Souvik
+  year: 2026

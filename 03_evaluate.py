@@ -30,8 +30,30 @@ from sid_data import SIDDataset
 from sidnet import PATTERNS, SIDNet
 
 
+FAMILIES = {"single-direction": ["N", "S", "E", "W"],
+            "two-direction": ["NS", "NE", "NW", "SE", "SW", "EW"],
+            "three-direction": ["NSE", "NSW", "NEW", "SEW"],
+            "four-direction (NSEW)": ["NSEW"]}
+
+
+def summary(res):
+    """The rows of the results summary table of the paper."""
+    pc = res["per_class"]
+    out = {"overall accuracy": res["accuracy"],
+           "topology-reconstruction agreement": res["topology_reconstruction_agreement"],
+           "mean per-direction F1": float(np.mean([m["f1"] for m in res["per_direction"].values()]))}
+    for fam, names in FAMILIES.items():
+        accs = [pc[n]["accuracy"] for n in names if n in pc]
+        if accs:
+            out[f"{fam} accuracy (lowest class)"] = min(accs)
+    maes = [pc[n]["mae"] for n in FAMILIES["single-direction"] if n in pc and "mae" in pc[n]]
+    if maes:
+        out["noise-strength MAE, single-direction (highest class)"] = max(maes)
+    return out
+
+
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, uniform=True):
     model.eval()
     patterns = PATTERNS.to(device)
     conf = np.zeros((N_CLASSES, N_CLASSES), dtype=np.int64)
@@ -59,7 +81,7 @@ def evaluate(model, loader, device):
             if act.any():
                 err[NOISE_NAMES[y[i].item()]].extend(e[i][act].tolist())
                 vals = alpha[i][act]
-                if torch.all(vals == vals[0]):
+                if uniform and torch.all(vals == vals[0]):
                     key = round(vals[0].item(), 1)
                     per_alpha[key][0] += int(pred[i] == y[i]); per_alpha[key][1] += 1
 
@@ -84,6 +106,9 @@ def evaluate(model, loader, device):
             row.update(mae=float(e.mean()), exact=float((e <= ALPHA_TOL_EXACT + 1e-9).mean()),
                        loose=float((e <= ALPHA_TOL_LOOSE + 1e-9).mean()))
         res["per_class"][name] = row
+    res["summary"] = summary(res)
+    if not uniform:
+        del res["per_alpha_accuracy"]
     return res, conf
 
 
@@ -101,7 +126,7 @@ def main():
     model.load_state_dict(torch.load(a.checkpoint, map_location=device)["model"])
     ds = SIDDataset(a.data_dir, a.regime, a.split, NOISE_NAMES)
     dl = DataLoader(ds, 64, shuffle=False, num_workers=a.workers)
-    res, conf = evaluate(model, dl, device)
+    res, conf = evaluate(model, dl, device, uniform=a.regime == "uni")
 
     print(f"\n{a.regime} {a.split}: accuracy {100 * res['accuracy']:.2f}% "
           f"({np.trace(conf)} of {conf.sum()}), topology-reconstruction agreement "
@@ -114,6 +139,9 @@ def main():
         extra = (f"{m['mae']:8.3f}{100 * m['exact']:7.1f}%{100 * m['loose']:7.1f}%"
                  if "mae" in m else " " * 24)
         print(f"  {name:<9}{100 * m['accuracy']:7.2f}%{extra}{m['windows']:9d}")
+    print("  summary:")
+    for k, v in res["summary"].items():
+        print(f"    {k:<55} {v:.4f}" if "MAE" in k else f"    {k:<55} {100 * v:.2f}%")
     if a.regime == "uni":
         print("  accuracy per noise strength:",
               ", ".join(f"{k}: {100 * v:.1f}%" for k, v in res["per_alpha_accuracy"].items()))

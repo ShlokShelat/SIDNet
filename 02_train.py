@@ -71,8 +71,32 @@ def phase_settings(phase, regime):
     return (ep_u if regime == "uni" else ep_n), lr, accum, b_cls, b_dir, b_alp
 
 
+PHASE_ORDER = ["A", "B1", "B2", "B3", "B4"]
+
+
 def set_seed(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+
+def epoch_seed(seed, phase, ep):
+    """Seed of one epoch. Sampling order and dropout depend only on (seed, phase, epoch), so a run
+    that is interrupted and resumed follows the same sequence as an uninterrupted run."""
+    return seed * 1_000_003 + PHASE_ORDER.index(phase) * 1_000 + ep
+
+
+def run_info(args, device, model):
+    """Record of the software, hardware and settings of a training run."""
+    import platform, subprocess, h5py
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                                cwd=os.path.dirname(os.path.abspath(__file__))).stdout.strip() or None
+    except OSError:
+        commit = None
+    return {"args": vars(args), "git_commit": commit, "python": platform.python_version(),
+            "torch": torch.__version__, "numpy": np.__version__, "h5py": h5py.__version__,
+            "cuda": torch.version.cuda, "cudnn": torch.backends.cudnn.version(),
+            "device": torch.cuda.get_device_name(0) if device.type == "cuda" else "cpu",
+            "parameters": count_parameters(model), "started": time.strftime("%Y-%m-%d %H:%M:%S")}
 
 
 @torch.no_grad()
@@ -98,6 +122,9 @@ def validate(model, loader, device, w, b_cls, b_dir, b_alp):
 def train_phase(phase, model, regime, args, device, resume=None):
     """Train one phase. `resume` is the last-epoch state of this phase, if the job was interrupted."""
     n_ep, lr, accum, b_cls, b_dir, b_alp = phase_settings(phase, regime)
+    if args.quick:
+        n_ep = 1
+    batch = 8 if args.quick else BATCH_SIZE
     classes = PHASE_CLASSES[phase]
     print(f"\n=== [{regime}] Phase {phase}: {len(classes)} classes, {n_ep} epochs, lr {lr:g}, "
           f"accum {accum}, b_cls {b_cls}, b_dir {b_dir}, b_alp {b_alp}", flush=True)
@@ -110,9 +137,10 @@ def train_phase(phase, model, regime, args, device, resume=None):
     val_ds = SIDDataset(args.data_dir, regime, "val", classes)
     loader_kw = dict(num_workers=args.workers, pin_memory=device.type == "cuda",
                      persistent_workers=args.workers > 0)
-    train_dl = DataLoader(train_ds, BATCH_SIZE, sampler=class_balanced_sampler(train_ds),
+    sampler_gen = torch.Generator()
+    train_dl = DataLoader(train_ds, batch, sampler=class_balanced_sampler(train_ds, sampler_gen),
                           drop_last=True, **loader_kw)
-    val_dl = DataLoader(val_ds, BATCH_SIZE, shuffle=False, **loader_kw)
+    val_dl = DataLoader(val_ds, batch, shuffle=False, **loader_kw)
 
     w = class_weights().to(device)
     params = [p for p in model.parameters() if p.requires_grad]
@@ -134,7 +162,9 @@ def train_phase(phase, model, regime, args, device, resume=None):
 
     for ep in range(start, n_ep + 1):
         model.train()
-        t0, run_loss, seen = time.time(), 0.0, 0
+        sampler_gen.manual_seed(epoch_seed(args.seed, phase, ep))
+        torch.manual_seed(epoch_seed(args.seed, phase, ep))
+        t0, run_loss, seen, step = time.time(), 0.0, 0, 0
         opt.zero_grad(set_to_none=True)
         for step, (delta, ws, wl, y, alpha) in enumerate(train_dl, 1):
             delta, ws, wl, y, alpha = (t.to(device, non_blocking=True) for t in (delta, ws, wl, y, alpha))
@@ -150,6 +180,13 @@ def train_phase(phase, model, regime, args, device, resume=None):
             run_loss += loss.item() * y.numel(); seen += y.numel()
             if args.log_every and step % args.log_every == 0:
                 print(f"    step {step:6d}/{len(train_dl)}  loss {run_loss / seen:.4f}", flush=True)
+            if args.quick and step >= 10:
+                break
+        if step % accum:                                  # apply the gradients of a last partial accumulation
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(params, CLIP_NORM)
+            scaler.step(opt); scaler.update()
+            opt.zero_grad(set_to_none=True)
         sched.step()
 
         m = validate(model, val_dl, device, w, b_cls, b_dir, b_alp)
@@ -196,19 +233,31 @@ def main():
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--log_every", type=int, default=500, help="print the running loss every N steps (0: off)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--deterministic", action="store_true",
+                   help="deterministic GPU kernels (slower); without it, cuDNN autotuning and TF32 are used")
+    p.add_argument("--quick", action="store_true",
+                   help="pipeline test: 1 epoch per phase, 10 steps per epoch, batch 8")
     a = p.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
+    if a.deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
     set_seed(a.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        fast = not a.deterministic
+        torch.backends.cuda.matmul.allow_tf32 = fast
+        torch.backends.cudnn.allow_tf32 = fast
+        torch.backends.cudnn.benchmark = fast
+        torch.backends.cudnn.deterministic = a.deterministic
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     else:
         print("WARNING: no GPU found, training on CPU will be very slow")
     model = SIDNet().to(device)
     print(f"SIDNet: {count_parameters(model):,} trainable parameters")
+    info_path = os.path.join(a.out_dir, f"{a.regime}_run_info.json")
+    with open(info_path, "a") as f:                       # one line per start or resume of the run
+        f.write(json.dumps(run_info(a, device, model)) + "\n")
 
     phases = [s.strip() for s in a.phases.split(",") if s.strip()]
     last_path = os.path.join(a.out_dir, f"{a.regime}_last.pt")
@@ -217,7 +266,7 @@ def main():
         state = torch.load(last_path, map_location=device, weights_only=False)
         if state["phase"] in phases:
             k = phases.index(state["phase"])
-            n_ep = phase_settings(state["phase"], a.regime)[0]
+            n_ep = 1 if a.quick else phase_settings(state["phase"], a.regime)[0]
             if state["epoch"] >= n_ep:                      # that phase had finished
                 model.load_state_dict(torch.load(os.path.join(
                     a.out_dir, f"{a.regime}_phase{state['phase']}_best.pt"), map_location=device)["model"])

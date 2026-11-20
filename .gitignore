@@ -1,7 +1,13 @@
 data/
+data_quick/
 checkpoints/
+checkpoints_quick/
 results/
-logs/
+results_quick/
+figures_section3/
+output_section3/
+logs/*
+!logs/.gitkeep
 __pycache__/
 *.pyc
 .DS_Store

@@ -2,7 +2,7 @@
 # SIDNet pipeline for one regime: generate the dataset, train, evaluate.
 #
 #   bash   scripts/run_all.sh uni          # SID-Uni
-#   sbatch scripts/run_all.sh nuni         # SID-nUni as a SLURM job
+#   sbatch scripts/run_all.sh nuni         # SID-nUni as a SLURM job (submit from the repository root)
 #
 # Settings (environment variables): DATA, CKPT, RESULTS, WORKERS, VENV.
 # Every step can be restarted: finished simulations are skipped, and training

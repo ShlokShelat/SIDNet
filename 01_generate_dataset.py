@@ -25,6 +25,7 @@ Usage
 
 import argparse
 import os
+from functools import partial
 from multiprocessing import Pool
 
 import h5py
@@ -110,13 +111,20 @@ def file_name(regime, name, strengths, seed, split):
     return f"{regime}_{name}_{tag}_s{seed}_{split}.h5"
 
 
-def run_task(task):
+QUICK_FRAMES, QUICK_WARMUP = 128, 2_000      # --quick: pipeline test only
+
+
+def run_task(task, quick=False):
     out_dir, regime, name, strengths, seed, split = task
     path = os.path.join(out_dir, file_name(regime, name, strengths, seed, split))
+    n_frames, n_warmup = (QUICK_FRAMES, QUICK_WARMUP) if quick else (N_FRAMES[regime], N_WARMUP)
     if os.path.exists(path):
+        with h5py.File(path, "r") as f:
+            if int(f.attrs["n_frames"]) != n_frames or int(f.attrs["n_warmup"]) != n_warmup:
+                raise RuntimeError(f"{path} was made with other settings (quick test?); use another --out_dir")
         return path
     alpha = dict(NO_NOISE, **strengths)
-    frames = simulate(alpha, seed, N_FRAMES[regime])
+    frames = simulate(alpha, seed, n_frames, n_warmup)
     tmp = path + ".tmp"
     with h5py.File(tmp, "w") as f:
         # chunks of 16 frames: a 64-frame sample reads only the 4-5 chunks it needs
@@ -125,7 +133,7 @@ def run_task(task):
         f.create_dataset("z_mean", data=frames.astype(np.float64).mean(0).astype(np.float32))
         f.create_dataset("alpha_vec", data=np.array([alpha[d] for d in DIRS], np.float32))
         f.attrs.update(noise_name=name, split=split, regime=regime, seed=seed,
-                       n_frames=N_FRAMES[regime], n_warmup=N_WARMUP)
+                       n_frames=n_frames, n_warmup=n_warmup)
     os.replace(tmp, path)
     print(f"  [ok] {os.path.basename(path)}", flush=True)
     return path
@@ -158,19 +166,28 @@ def main():
     p.add_argument("--n_workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=None,
                    help="first seed (default 1000 for uni, 200000 for nuni)")
+    p.add_argument("--quick", action="store_true",
+                   help="pipeline test: one short simulation per class and split (128 frames, 2,000 warm-up steps)")
     a = p.parse_args()
     os.makedirs(a.out_dir, exist_ok=True)
     seed0 = a.seed if a.seed is not None else (1_000 if a.regime == "uni" else 200_000)
     tasks = make_tasks(a.regime, a.out_dir, seed0)
+    if a.quick:
+        first = {}
+        for t in tasks:
+            first.setdefault((t[2], t[5]), t)
+        tasks = list(first.values())
     counts = {s: sum(t[5] == s for t in tasks) for s in ("train", "val", "test")}
     print(f"SID-{'Uni' if a.regime == 'uni' else 'nUni'}: {len(tasks)} simulations {counts}, "
-          f"{N_FRAMES[a.regime]} frames each, warm-up {N_WARMUP} steps without noise")
+          f"{QUICK_FRAMES if a.quick else N_FRAMES[a.regime]} frames each, "
+          f"warm-up {QUICK_WARMUP if a.quick else N_WARMUP} steps without noise" + (" [quick test]" if a.quick else ""))
+    job = partial(run_task, quick=a.quick)
     if a.n_workers <= 1:
         for t in tasks:
-            run_task(t)
+            job(t)
     else:
         with Pool(a.n_workers) as pool:
-            pool.map(run_task, tasks, chunksize=1)
+            pool.map(job, tasks, chunksize=1)
     write_reference(a.regime, a.out_dir)
     done = [f for f in os.listdir(a.out_dir) if f.startswith(a.regime + "_") and f.endswith(
         ("_train.h5", "_val.h5", "_test.h5"))]
